@@ -128,7 +128,7 @@ if [[ "${GENERATE_SSL,,}" == "y" ]]; then
     fi
     
     print_message "Generating SSL certificate for $DOMAIN_LIST using Certbot..."
-    certbot certonly --standalone -d $(echo $DOMAIN_LIST | tr ',' ' -d ') --agree-tos --non-interactive
+    certbot certonly --webroot -w /var/www/html -d $(echo $DOMAIN_LIST | tr ',' ' -d ') --agree-tos --non-interactive
     
     if [ $? -ne 0 ]; then
         print_error "Failed to generate SSL certificate. Please check your domain configuration."
