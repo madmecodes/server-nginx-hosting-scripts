@@ -114,37 +114,11 @@ if [[ "${ADD_PATHS,,}" == "y" ]]; then
     done
 fi
 
-# SSL configuration
-print_message "\nSSL CONFIGURATION"
-print_message "----------------"
-get_user_input "Generate new SSL certificate? (y/n)" GENERATE_SSL "y"
-
-if [[ "${GENERATE_SSL,,}" == "y" ]]; then
-    # Check if certbot is installed
-    if ! command -v certbot &> /dev/null; then
-        print_warning "Certbot is not installed. Installing Certbot..."
-        apt-get update
-        apt-get install -y certbot python3-certbot-nginx
-    fi
-    
-    print_message "Generating SSL certificate for $DOMAIN_LIST using Certbot..."
-    certbot certonly --webroot -w /var/www/html -d $(echo $DOMAIN_LIST | tr ',' ' -d ') --agree-tos --non-interactive
-    
-    if [ $? -ne 0 ]; then
-        print_error "Failed to generate SSL certificate. Please check your domain configuration."
-        exit 1
-    fi
-    
-    print_success "SSL certificate generated successfully!"
-else
-    print_message "Skipping SSL certificate generation. Using existing certificates."
-fi
-
-# Create Nginx configuration
+# Create Nginx configuration first
 print_message "\nCREATING NGINX CONFIGURATION"
 print_message "---------------------------"
 
-# Create Nginx config file
+# Create Nginx config file (HTTP only initially)
 CONFIG_FILE="/etc/nginx/sites-available/$DOMAIN"
 
 cat > "$CONFIG_FILE" << EOF
@@ -153,33 +127,16 @@ upstream ${UPSTREAM_NAME}_backend {
     server localhost:${CONTAINER_PORT};
 }
 
-# HTTP server block to redirect to HTTPS
+# HTTP server block
 server {
     listen 80;
     server_name ${NGINX_SERVER_NAME};
     
-    # Redirect all HTTP traffic to HTTPS
-    return 301 https://\$host\$request_uri;
-}
-
-# HTTPS server block
-server {
-    listen 443 ssl;
-    server_name ${NGINX_SERVER_NAME};
+    # Location for ACME challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
     
-    # SSL certificate paths from Certbot
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    
-    # Improved SSL security settings
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    
-    # Increase body size limit if needed
-    client_max_body_size 50M;
-
 EOF
 
 # Add location blocks
@@ -187,20 +144,7 @@ for i in "${!PATHS[@]}"; do
     PATH_PATTERN="${PATHS[$i]}"
     PROXY_DESTINATION="${PROXY_PATHS[$i]}"
     
-    # Special case for root location
-    if [ "$PATH_PATTERN" == "/" ]; then
-        cat >> "$CONFIG_FILE" << EOF
-    # Default location
-    location / {
-        proxy_pass http://${UPSTREAM_NAME}_backend;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-EOF
-    else
-        cat >> "$CONFIG_FILE" << EOF
+    cat >> "$CONFIG_FILE" << EOF
     # Proxy settings for ${PATH_PATTERN}
     location ${PATH_PATTERN} {
         proxy_pass http://${UPSTREAM_NAME}_backend${PROXY_DESTINATION};
@@ -210,7 +154,6 @@ EOF
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 EOF
-    fi
 done
 
 # Close the server block
@@ -218,7 +161,7 @@ cat >> "$CONFIG_FILE" << EOF
 }
 EOF
 
-print_success "Nginx configuration file created at $CONFIG_FILE"
+print_success "Initial Nginx configuration file created at $CONFIG_FILE"
 
 # Create symbolic link to enable the site
 ln -sf "$CONFIG_FILE" /etc/nginx/sites-enabled/
@@ -241,6 +184,117 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+print_success "Initial Nginx configuration loaded successfully!"
+
+# SSL configuration
+print_message "\nSSL CONFIGURATION"
+print_message "----------------"
+get_user_input "Generate new SSL certificate? (y/n)" GENERATE_SSL "y"
+
+if [[ "${GENERATE_SSL,,}" == "y" ]]; then
+    # Check if certbot is installed
+    if ! command -v certbot &> /dev/null; then
+        print_warning "Certbot is not installed. Installing Certbot..."
+        apt-get update
+        apt-get install -y certbot python3-certbot-nginx
+    fi
+    
+    print_message "Generating SSL certificate for $DOMAIN_LIST using Certbot..."
+    
+    # Use the Nginx plugin to both obtain and install the certificate
+    certbot --nginx -d ${DOMAIN_LIST//,/ -d } --agree-tos --non-interactive
+    
+    if [ $? -ne 0 ]; then
+        print_error "Failed to generate SSL certificate. Please check your domain configuration."
+        exit 1
+    fi
+    
+    print_success "SSL certificate generated and installed successfully!"
+else
+    print_message "Skipping SSL certificate generation. Using existing certificates."
+    
+    # Add SSL configuration manually if we're not generating a new certificate
+    # This assumes the certificates already exist
+    
+    # Backup the original config
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    
+    # Create a new config with SSL
+    cat > "$CONFIG_FILE" << EOF
+# Upstream block for the backend server
+upstream ${UPSTREAM_NAME}_backend {
+    server localhost:${CONTAINER_PORT};
+}
+
+# HTTP server block to redirect to HTTPS
+server {
+    listen 80;
+    server_name ${NGINX_SERVER_NAME};
+    
+    # Location for ACME challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+    
+    # Redirect all HTTP traffic to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+# HTTPS server block
+server {
+    listen 443 ssl;
+    server_name ${NGINX_SERVER_NAME};
+    
+    # SSL certificate paths
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    
+    # Improved SSL security settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Increase body size limit if needed
+    client_max_body_size 50M;
+
+EOF
+
+    # Add location blocks to the HTTPS server
+    for i in "${!PATHS[@]}"; do
+        PATH_PATTERN="${PATHS[$i]}"
+        PROXY_DESTINATION="${PROXY_PATHS[$i]}"
+        
+        cat >> "$CONFIG_FILE" << EOF
+    # Proxy settings for ${PATH_PATTERN}
+    location ${PATH_PATTERN} {
+        proxy_pass http://${UPSTREAM_NAME}_backend${PROXY_DESTINATION};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+EOF
+    done
+
+    # Close the server block
+    cat >> "$CONFIG_FILE" << EOF
+}
+EOF
+
+    # Test and reload Nginx
+    nginx -t && systemctl reload nginx
+    
+    if [ $? -ne 0 ]; then
+        print_error "Failed to apply SSL configuration. Reverting to backup."
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+        systemctl reload nginx
+        exit 1
+    fi
+    
+    print_success "Manual SSL configuration applied successfully!"
+fi
+
 print_success "Nginx configuration completed and service reloaded successfully!"
 print_message "Your website should now be accessible at https://$DOMAIN"
 
@@ -249,7 +303,6 @@ print_message "\nNEXT STEPS"
 print_message "----------"
 print_message "1. Make sure your Docker container is running on port $CONTAINER_PORT"
 print_message "2. Ensure your firewall allows incoming traffic on ports 80 and 443"
-print_message "3. Set up a cron job for SSL certificate renewal:"
-print_message "   0 3 * * * certbot renew --quiet && systemctl reload nginx"
+print_message "3. SSL certificate renewal is automatically handled by Certbot's cron job"
 
 exit 0
